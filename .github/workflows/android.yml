@@ -1,19 +1,22 @@
 name: Android APK
 
-# Builds the PdfCraft web app (WebAssembly), then packages it with Capacitor, the same toolchain
-# as HomeMed Cabinet. The Android project (mobile/android) is generated here on every run.
-#   * Every push to main/master that touches the app, the web UI or this folder
-#   * By hand: Actions > "Android APK" > Run workflow
-#   * Tag:     git tag android-v0.9.0 && git push origin android-v0.9.0   (also makes a Release)
+# PdfCraft for Android. One self-contained file: it builds the web app (WebAssembly), packages it
+# with Capacitor, and produces an installable APK. Nothing else needs to be added to the repository
+# besides the PdfCraft project itself (https://github.com/storytold/pdfcraft).
+#   * Runs on push (when the app or this file changes), or by hand: Actions > Android APK > Run workflow
+#   * Tag  git tag android-v0.9.0 && git push origin android-v0.9.0  also publishes a GitHub Release
+#   * Optional secrets for a permanent signing key: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
+#     ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD (without them the APK uses a debug key and still installs)
 on:
   push:
-    branches: [main, master]
-    paths:
-      - "mobile/**"
-      - "apps/pdfcraft-web/**"
-      - "crates/ui-egui/**"
-      - ".github/workflows/android.yml"
+    branches: ["**"]
     tags: ["android-v*"]
+    paths:
+      - ".github/workflows/android.yml"
+      - "apps/pdfcraft-web/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
 
 permissions:
@@ -26,14 +29,487 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   apk:
     name: Build APK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Check the PdfCraft sources are in the repository
+        run: |
+          missing=0
+          for f in Cargo.toml crates/ui-egui/src/lib.rs apps/pdfcraft-web/src/main.rs apps/pdfcraft-web/index.html apps/pdfcraft-web/Trunk.toml; do
+            if [ ! -e "$f" ]; then echo "::error::Missing file: $f"; missing=1; fi
+          done
+          if [ "$missing" = 1 ]; then
+            echo "::error::The repository root must contain the whole PdfCraft project (Cargo.toml, crates/, apps/ ...)."
+            ls -la
+            exit 1
+          fi
+
+      - name: Write the mobile files (phone UI, Android glue, Capacitor setup)
+        run: |
+          mkdir -p mobile-ci
+          cat > mobile-ci/package.json <<'__PDFCRAFT_EOF__'
+          {
+            "name": "pdfcraft-android",
+            "private": true,
+            "version": "0.0.0",
+            "dependencies": {
+              "@capacitor/android": "^8.4.0",
+              "@capacitor/app": "^8.0.4",
+              "@capacitor/core": "^8.4.0",
+              "@capacitor/filesystem": "^8.1.2",
+              "@capacitor/share": "^8.0.1"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "^8.4.0"
+            }
+          }
+          __PDFCRAFT_EOF__
+          cat > mobile-ci/capacitor.config.json <<'__PDFCRAFT_EOF__'
+          {
+            "appId": "app.pdfcraft.android",
+            "appName": "PdfCraft",
+            "webDir": "www",
+            "server": {
+              "androidScheme": "https"
+            }
+          }
+          __PDFCRAFT_EOF__
+          cat > mobile-ci/signing.gradle <<'__PDFCRAFT_EOF__'
+          // Applied at the end of android/app/build.gradle by patch_android.py.
+          // Without a keystore the release APK is signed with the debug key, so it installs
+          // (an unsigned APK, which is what `assembleRelease` makes by default, does not).
+          android {
+              defaultConfig {
+                  versionCode = Integer.parseInt(System.getenv('APP_VERSION_CODE') ?: '1')
+                  versionName = System.getenv('APP_VERSION_NAME') ?: '0.0.0'
+              }
+              signingConfigs {
+                  ci {
+                      def ksPath = System.getenv('KEYSTORE_PATH')
+                      if (ksPath != null && new File(ksPath).exists()) {
+                          storeFile = new File(ksPath)
+                          storePassword = System.getenv('KEYSTORE_PASSWORD')
+                          keyAlias = System.getenv('KEY_ALIAS')
+                          keyPassword = System.getenv('KEY_PASSWORD')
+                      }
+                  }
+              }
+              buildTypes {
+                  release {
+                      def ksPath = System.getenv('KEYSTORE_PATH')
+                      signingConfig = (ksPath != null && new File(ksPath).exists()) ? signingConfigs.ci : signingConfigs.debug
+                  }
+              }
+          }
+          __PDFCRAFT_EOF__
+          cat > mobile-ci/ui_patch.py <<'__PDFCRAFT_EOF__'
+          #!/usr/bin/env python3
+          """Phone layout for the egui UI (run from the repository root).
+          Exact-text edits: if the sources changed and a piece is not found, nothing is written and the build falls back to the stock UI."""
+          import sys
+
+
+          def edit(path, pairs):
+              with open(path, encoding="utf-8") as f:
+                  text = f.read()
+              for old, new in pairs:
+                  if text.count(old) != 1:
+                      sys.exit("ui_patch: text not found exactly once in %s:\n%s" % (path, old[:160]))
+                  text = text.replace(old, new)
+              return text
+
+
+          MAIN = "apps/pdfcraft-web/src/main.rs"
+          DOCK = "crates/ui-egui/src/docking.rs"
+          LIB = "crates/ui-egui/src/lib.rs"
+
+          RESTORE = """                        app.restore(&json);
+                              }
+          """
+          QUERY = """#[cfg(target_arch = "wasm32")]
+          fn query_param(key: &str) -> Option<String> {"""
+          NAME = """let name = url.rsplit('/').next().unwrap_or("document.pdf").split('?').next().unwrap_or("document.pdf").to_string();"""
+
+          DOCK_ANCHOR = """    let output = DockArea::new(egui::Id::new("pdfcraft-docking")).show_with_limits("""
+          COMPACT = """    // Phones: with no room for panes side by side, the open Tools or Inspector pane becomes a
+              // sheet under the document (drag its top edge to resize) instead of a column beside it.
+              if ui.available_width() < COMPACT_WIDTH {
+                  let sheet = if app.active.is_some() && rendered.contains(&Panel::Inspector) {
+                      Some(Panel::Inspector)
+                  } else if rendered.contains(&Panel::Tools) {
+                      Some(Panel::Tools)
+                  } else {
+                      None
+                  };
+                  if let Some(panel) = sheet {
+                      egui::Panel::bottom("pdfcraft-compact-sheet")
+                          .resizable(true)
+                          .default_size(300.0)
+                          .size_range(140.0..=560.0)
+                          .frame(egui::Frame::NONE.fill(t.panel))
+                          .show(ui, |ui| {
+                              if panel == Panel::Inspector {
+                                  ui.data_mut(|data| data.insert_temp(egui::Id::new("pdfcraft-inspector-body"), ui.max_rect()));
+                                  crate::panels::right_panel(app, ui);
+                              } else {
+                                  crate::panels::left_panel(app, ui);
+                              }
+                          });
+                  }
+                  egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| canvas_body(app, ui, t.pasteboard));
+                  let _ = sync(&mut workspace, app);
+                  drain_reveals(&mut workspace, app);
+                  publish_visibility(app, &workspace);
+                  app.docking = workspace;
+                  return;
+              }
+          """
+          ARM = """            Panel::Canvas => {
+                          ui.painter().rect_filled(ui.max_rect(), 0.0, t.pasteboard);
+                          match app.active {
+                              None if app.combine_showing() => crate::combine_ui::page(app, ui),
+                              None => crate::home::show(app, ui),
+                              Some(index) => match crate::compare_ui::side_by_side(app, index) {
+                                  Some((old, new)) => crate::compare_ui::compare_area(app, old, new, ui),
+                                  None => crate::canvas::document_area(app, index, ui),
+                              },
+                          }
+                      }
+          """
+          LIMITS = "fn panel_limits(panel: &Panel) -> PanelLimits {"
+          CANVAS_FN = """/// Windows narrower than this (in points) get the phone layout: one pane at a time, with Tools
+          /// and the Inspector as a sheet under the document.
+          pub const COMPACT_WIDTH: f32 = 700.0;
+
+          /// The document area: the open document, Home, or the Combine page.
+          fn canvas_body(app: &mut crate::PdfCraftApp, ui: &mut egui::Ui, pasteboard: egui::Color32) {
+              ui.painter().rect_filled(ui.max_rect(), 0.0, pasteboard);
+              match app.active {
+                  None if app.combine_showing() => crate::combine_ui::page(app, ui),
+                  None => crate::home::show(app, ui),
+                  Some(index) => match crate::compare_ui::side_by_side(app, index) {
+                      Some((old, new)) => crate::compare_ui::compare_area(app, old, new, ui),
+                      None => crate::canvas::document_area(app, index, ui),
+                  },
+              }
+          }
+
+          """
+          READ_OLD = """            if self.mode == Mode::Read && self.right.is_some() {
+                          egui::Panel::right("read_right_panel")"""
+          READ_NEW = """            if self.mode == Mode::Read && self.right.is_some() && ui.available_width() < docking::COMPACT_WIDTH {
+                          // Phone: the pane is a sheet under the page, not a column beside it.
+                          egui::Panel::bottom("read_right_sheet")
+                              .resizable(true)
+                              .default_size(300.0)
+                              .size_range(140.0..=560.0)
+                              .frame(egui::Frame::NONE)
+                              .show(ui, |ui| panels::right_panel(self, ui));
+                      } else if self.mode == Mode::Read && self.right.is_some() {
+                          egui::Panel::right("read_right_panel")"""
+
+          out = {
+              MAIN: edit(MAIN, [
+                  (RESTORE, RESTORE + """                    // Phones (the Android app passes `?mobile=1`): a slightly larger interface for fingers.
+                              if is_touch_phone() {
+                                  app.system_text_scale = 1.15;
+                              }
+          """),
+                  (QUERY, """/// `?mobile=1` (set by the Android app and by the page's own phone check), or a narrow window.
+          #[cfg(target_arch = "wasm32")]
+          fn is_touch_phone() -> bool {
+              if query_param("mobile").as_deref() == Some("1") {
+                  return true;
+              }
+              web_sys::window().and_then(|w| w.inner_width().ok()).and_then(|w| w.as_f64()).is_some_and(|w| w < 700.0)
+          }
+
+          """ + QUERY),
+                  (NAME, NAME + """
+                                      // The Android app percent-encodes the file name in the URL (spaces, Arabic, ...).
+                                      let name = js_sys::decode_uri_component(&name).ok().map(String::from).unwrap_or(name);"""),
+              ]),
+              DOCK: edit(DOCK, [
+                  (DOCK_ANCHOR, COMPACT + DOCK_ANCHOR),
+                  (ARM, "            Panel::Canvas => canvas_body(app, ui, t.pasteboard),\n"),
+                  (LIMITS, CANVAS_FN + LIMITS),
+              ]),
+              LIB: edit(LIB, [(READ_OLD, READ_NEW)]),
+          }
+          for path, text in out.items():
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(text)
+          print("ui_patch: phone layout applied to %d files" % len(out))
+          __PDFCRAFT_EOF__
+          cat > mobile-ci/web_patch.py <<'__PDFCRAFT_EOF__'
+          #!/usr/bin/env python3
+          """Adds the phone/Android glue (mobile-ci/glue.html) to the web page (run from the repository root)."""
+          import re
+          import sys
+
+          PAGE = "apps/pdfcraft-web/index.html"
+          with open(PAGE, encoding="utf-8") as f:
+              page = f.read()
+          with open("mobile-ci/glue.html", encoding="utf-8") as f:
+              glue = f.read()
+          if 'id="pdfcraft"' not in page or "</head>" not in page:
+              sys.exit("web_patch: unexpected index.html (no canvas#pdfcraft / </head>)")
+          if "pdfcraft-mobile-glue" in page:
+              sys.exit(0)
+          page = re.sub(
+              r'<meta name="viewport"[^>]*>',
+              '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />',
+              page,
+              count=1,
+          )
+          page = page.replace("</head>", glue.rstrip() + "\n  </head>", 1)
+          with open(PAGE, "w", encoding="utf-8") as f:
+              f.write(page)
+          print("web_patch: glue added to " + PAGE)
+          __PDFCRAFT_EOF__
+          cat > mobile-ci/glue.html <<'__PDFCRAFT_EOF__'
+          <!-- pdfcraft-mobile-glue -->
+              <meta name="theme-color" content="#f1f1f3" />
+              <style>
+                html, body { overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
+                /* Keep clear of the status/navigation bars and the camera cut-out (Android draws edge to edge). */
+                body {
+                  box-sizing: border-box;
+                  padding-top: max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
+                  padding-right: max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px));
+                  padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
+                  padding-left: max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px));
+                }
+                canvas { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+              </style>
+              <script>
+                // Phones get `?mobile=1`: the app draws its controls a little larger.
+                (function () {
+                  if (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "") && !/[?&]mobile=/.test(location.search)) {
+                    var q = location.search ? location.search + "&mobile=1" : "?mobile=1";
+                    history.replaceState(null, "", location.pathname + q + location.hash);
+                  }
+                })();
+              </script>
+              <script>
+                // Inside the Android app (Capacitor). In a normal browser none of this runs.
+                //   Save/Export -> cache file + system share sheet. "Open with PdfCraft" -> ?file=. Back = press twice.
+                (function () {
+                  var cap = window.Capacitor;
+                  if (!cap || !cap.isNativePlatform || !cap.isNativePlatform()) return;
+                  function plugin(name) {
+                    return (cap.Plugins && cap.Plugins[name]) || (cap.registerPlugin && cap.registerPlugin(name));
+                  }
+                  var FS = plugin("Filesystem"), Share = plugin("Share"), App = plugin("App");
+                  var ar = /^ar/i.test(navigator.language || "");
+                  var TEXT = {
+                    back: ar ? "اضغط رجوع مرة أخرى للخروج" : "Press back again to exit",
+                    open: ar ? "فتح ملف PDF جديد؟ ستضيع التغييرات غير المحفوظة." : "Open this PDF? Unsaved changes will be lost.",
+                    fail: ar ? "تعذّر حفظ الملف" : "Could not save the file",
+                  };
+                  function toast(message) {
+                    var box = document.createElement("div");
+                    box.textContent = message;
+                    box.style.cssText =
+                      "position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom,0px) + 72px);transform:translateX(-50%);" +
+                      "background:#222;color:#fff;padding:10px 16px;border-radius:20px;font:14px sans-serif;z-index:99;" +
+                      "max-width:80%;text-align:center;pointer-events:none";
+                    document.body.appendChild(box);
+                    setTimeout(function () { box.remove(); }, 2200);
+                  }
+                  function bytesFromBase64(b64) {
+                    var bin = atob(b64), out = new Uint8Array(bin.length);
+                    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+                    return out;
+                  }
+                  function base64Of(blob) {
+                    return new Promise(function (resolve, reject) {
+                      var reader = new FileReader();
+                      reader.onerror = reject;
+                      reader.onloadend = function () {
+                        var s = String(reader.result);
+                        resolve(s.slice(s.indexOf(",") + 1));
+                      };
+                      reader.readAsDataURL(blob);
+                    });
+                  }
+                  function safeName(name) {
+                    return String(name || "document.pdf").replace(/[\\/:*?"<>|]/g, "_") || "document.pdf";
+                  }
+                  async function saveBlob(name, blob) {
+                    name = safeName(name);
+                    var CHUNK = 3 * 1024 * 1024; // a multiple of 3: each chunk is valid base64 on its own
+                    for (var offset = 0, first = true; first || offset < blob.size; offset += CHUNK) {
+                      var data = await base64Of(blob.slice(offset, offset + CHUNK));
+                      if (first) await FS.writeFile({ path: name, data: data, directory: "CACHE", recursive: true });
+                      else await FS.appendFile({ path: name, data: data, directory: "CACHE" });
+                      first = false;
+                    }
+                    var uri = await FS.getUri({ path: name, directory: "CACHE" });
+                    await Share.share({ title: name, url: uri.uri, dialogTitle: name });
+                  }
+                  var nativeClick = HTMLAnchorElement.prototype.click;
+                  HTMLAnchorElement.prototype.click = function () {
+                    var a = this;
+                    if (a.hasAttribute("download") && a.href && a.href.indexOf("blob:") === 0) {
+                      var name = a.getAttribute("download");
+                      fetch(a.href)
+                        .then(function (r) { return r.blob(); })
+                        .then(function (blob) { return saveBlob(name, blob); })
+                        .catch(function (e) { console.error("save failed", e); toast(TEXT.fail); });
+                      return;
+                    }
+                    return nativeClick.apply(a, arguments);
+                  };
+
+                  var opened = null; // { name, bytes }
+                  function nameFromUrl(url) {
+                    try {
+                      var last = decodeURIComponent(url.split("?")[0]).split("/").pop();
+                      if (/\.pdf$/i.test(last)) return last;
+                    } catch (e) { /* opaque content:// id */ }
+                    return "document.pdf";
+                  }
+                  function loadUri(url) {
+                    return FS.readFile({ path: url }).then(function (result) {
+                      opened = { name: nameFromUrl(url), bytes: bytesFromBase64(String(result.data)) };
+                      history.replaceState(null, "", location.pathname + "?mobile=1&file=" + encodeURIComponent("./__open__/" + encodeURIComponent(opened.name)));
+                    });
+                  }
+                  var pending = null; // set by a reload that follows an "open with" while the app was running
+                  try { pending = sessionStorage.getItem("pdfcraft.open"); sessionStorage.removeItem("pdfcraft.open"); } catch (e) { /* storage off */ }
+                  if (/__open__/.test(location.search)) history.replaceState(null, "", location.pathname + "?mobile=1");
+                  var started = (pending ? Promise.resolve(pending) : App.getLaunchUrl().then(function (r) { return r && r.url; }))
+                    .then(function (url) { return url ? loadUri(url) : null; })
+                    .catch(function (e) { console.error("open failed", e); });
+                  var ready = Promise.race([started, new Promise(function (resolve) { setTimeout(resolve, 4000); })]);
+
+                  // The app reads ?file= when it starts: hold its WebAssembly download until the file is read,
+                  // and serve the virtual ./__open__/ URL from memory.
+                  var realFetch = window.fetch.bind(window);
+                  window.fetch = function (input, init) {
+                    var url = typeof input === "string" ? input : (input && (input.url || input.href)) || String(input);
+                    if (opened && url.indexOf("/__open__/") !== -1) {
+                      return Promise.resolve(new Response(opened.bytes, { status: 200, headers: { "Content-Type": "application/pdf" } }));
+                    }
+                    if (/\.wasm(\?|#|$)/.test(url)) return ready.then(function () { return realFetch(input, init); });
+                    return realFetch(input, init);
+                  };
+
+                  App.addListener("appUrlOpen", function (event) {
+                    if (!event || !event.url) return;
+                    if (!window.confirm(TEXT.open)) return;
+                    try { sessionStorage.setItem("pdfcraft.open", event.url); } catch (e) { /* storage off */ }
+                    location.reload();
+                  });
+                  var lastBack = 0;
+                  App.addListener("backButton", function () {
+                    var now = Date.now();
+                    if (now - lastBack < 2000) App.exitApp();
+                    else { lastBack = now; toast(TEXT.back); }
+                  });
+                })();
+              </script>
+          __PDFCRAFT_EOF__
+          cat > mobile-ci/patch_android.py <<'__PDFCRAFT_EOF__'
+          #!/usr/bin/env python3
+          """Customises the Android project that `npx cap add android` generated (run from mobile-ci/)."""
+          import glob
+          import os
+          import shutil
+          import sys
+
+          MOBILE = os.path.dirname(os.path.abspath(__file__))
+          REPO = os.path.dirname(MOBILE)
+          APP = os.path.join(MOBILE, "android", "app")
+          RES = os.path.join(APP, "src", "main", "res")
+          MANIFEST = os.path.join(APP, "src", "main", "AndroidManifest.xml")
+          ICON = os.path.join(REPO, "assets", "app-icon", "hicolor", "256x256", "apps", "ai.storyteller.pdfcraft.png")
+
+
+          def log(message):
+              print("[patch_android] " + message)
+
+
+          # 1. Manifest: "Open with PdfCraft" for PDFs, no cloud backup of documents, room for big files.
+          with open(MANIFEST, encoding="utf-8") as f:
+              manifest = f.read()
+          PDF_FILTER = """
+                      <!-- "Open with PdfCraft" from file managers, mail, browsers... -->
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.BROWSABLE" />
+                          <data android:scheme="content" android:mimeType="application/pdf" />
+                          <data android:scheme="file" android:mimeType="application/pdf" />
+                      </intent-filter>
+          """
+          if "application/pdf" not in manifest:
+              if "</activity>" not in manifest:
+                  sys.exit("[patch_android] no </activity> in the manifest: the Capacitor template changed")
+              manifest = manifest.replace("</activity>", PDF_FILTER + "        </activity>", 1)
+          manifest = manifest.replace('android:allowBackup="true"', 'android:allowBackup="false"')
+          if "android:largeHeap" not in manifest:
+              manifest = manifest.replace("<application", '<application\n        android:largeHeap="true"', 1)
+          if "android:windowSoftInputMode" not in manifest:
+              manifest = manifest.replace("<activity", '<activity\n            android:windowSoftInputMode="adjustResize"', 1)
+          with open(MANIFEST, "w", encoding="utf-8") as f:
+              f.write(manifest)
+          log("manifest patched")
+
+          # 2. Release signing + version.
+          shutil.copy(os.path.join(MOBILE, "signing.gradle"), os.path.join(APP, "signing.gradle"))
+          for name, line in (("build.gradle", "\napply from: 'signing.gradle'\n"), ("build.gradle.kts", '\napply(from = "signing.gradle")\n')):
+              path = os.path.join(APP, name)
+              if os.path.exists(path):
+                  with open(path, encoding="utf-8") as f:
+                      text = f.read()
+                  if "signing.gradle" not in text:
+                      with open(path, "a", encoding="utf-8") as f:
+                          f.write(line)
+                  log("signing hooked into " + name)
+                  break
+          else:
+              sys.exit("[patch_android] no android/app/build.gradle found")
+
+          # 3. Launcher icon and splash from the project's own icon (cosmetic: a problem here never fails the build).
+          try:
+              from PIL import Image, ImageDraw
+
+              src = Image.open(ICON).convert("RGBA")
+              for density, size in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)):
+                  folder = os.path.join(RES, "mipmap-" + density)
+                  os.makedirs(folder, exist_ok=True)
+                  for old in glob.glob(os.path.join(folder, "ic_launcher*")):
+                      os.remove(old)
+                  src.resize((size, size), Image.LANCZOS).save(os.path.join(folder, "ic_launcher.png"))
+                  big = src.resize((size * 4, size * 4), Image.LANCZOS)
+                  mask = Image.new("L", big.size, 0)
+                  ImageDraw.Draw(mask).ellipse((0, 0, big.size[0] - 1, big.size[1] - 1), fill=255)
+                  round_icon = Image.new("RGBA", big.size, (0, 0, 0, 0))
+                  round_icon.paste(big, (0, 0), mask)
+                  round_icon.resize((size, size), Image.LANCZOS).save(os.path.join(folder, "ic_launcher_round.png"))
+              shutil.rmtree(os.path.join(RES, "mipmap-anydpi-v26"), ignore_errors=True)  # would hide the PNGs on Android 8+
+              splash = Image.new("RGBA", (1024, 1024), (0x12, 0xA5, 0x8A, 255))
+              logo = src.resize((320, 320), Image.LANCZOS)
+              splash.paste(logo, (352, 352), logo)
+              splash = splash.convert("RGB").quantize(colors=64)
+              for target in glob.glob(os.path.join(RES, "drawable*", "splash.png")):
+                  splash.save(target, optimize=True)
+              log("icons and splash replaced")
+          except Exception as error:  # noqa: BLE001
+              log("icons skipped (default Capacitor icon stays): %s" % error)
+          __PDFCRAFT_EOF__
 
       - name: Install Rust (with the wasm32 target)
         uses: dtolnay/rust-toolchain@stable
@@ -46,36 +522,46 @@ jobs:
 
       - name: Install Trunk
         run: |
+          rustc --version
           if curl -fsSL https://github.com/trunk-rs/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C "$HOME/.cargo/bin" trunk; then
             trunk --version
           else
             cargo install trunk --locked
           fi
 
-      # The phone layout (Tools/Inspector as a bottom sheet, larger controls) is a source patch.
-      # If it ever stops compiling (after you update the project), the stock UI is built instead.
+      # The phone layout (Tools/Inspector as a bottom sheet, larger controls) edits the Rust sources.
+      # If the sources changed so much that it no longer fits or compiles, the stock UI is built instead
+      # (the Android glue, which is plain HTML/JS, is kept either way).
       - name: Build web app (phone UI)
         id: web_phone
         continue-on-error: true
         run: |
-          git apply --whitespace=nowarn mobile/mobile-ui.patch
+          python3 mobile-ci/ui_patch.py
+          python3 mobile-ci/web_patch.py
           cd apps/pdfcraft-web
           trunk build --release
 
       - name: Build web app (fallback, stock UI)
         if: steps.web_phone.outcome == 'failure'
         run: |
-          echo "::warning::The phone UI patch did not build; building the stock UI instead."
-          git checkout -- crates apps/pdfcraft-web/src
+          echo "::warning::The phone UI did not build (see the step above); building the stock UI instead."
+          git checkout -- .
           rm -rf dist
+          python3 mobile-ci/web_patch.py
           cd apps/pdfcraft-web
           trunk build --release
+
+      - name: Check the web build
+        run: |
+          ls -la dist/web | head -20
+          test -f dist/web/index.html
+          ls dist/web/*.wasm
 
       - name: Read version
         id: ver
         run: |
           v=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "name=$v" >> "$GITHUB_OUTPUT"
+          echo "name=${v:-0.0.0}" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -88,20 +574,19 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install Pillow (launcher icon)
+        run: python3 -m pip install --quiet --break-system-packages pillow || echo "::warning::Pillow not installed; the default icon is used."
+
       - name: Create the Android project (Capacitor)
-        working-directory: mobile
+        working-directory: mobile-ci
         run: |
-          test -f ../dist/web/index.html
           npm install
-          rm -rf www android
           mkdir www
           cp -R ../dist/web/. www/
           npx cap add android
-          python3 scripts/patch_android.py
+          python3 patch_android.py
           npx cap sync android
 
-      # Optional: sign with your own key (see ANDROID.md). Without it the APK is signed with a
-      # debug key: it installs fine, but each build has a different signature.
       - name: Prepare signing key
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -110,11 +595,14 @@ jobs:
             echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
             echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           else
-            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret: signing with the debug key."
+            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret: signing with the debug key (installs fine, but updates need the old app removed)."
           fi
 
+      - name: Set up Gradle (cache)
+        uses: gradle/actions/setup-gradle@v4
+
       - name: Build APK
-        working-directory: mobile/android
+        working-directory: mobile-ci/android
         env:
           APP_VERSION_NAME: ${{ steps.ver.outputs.name }}
           APP_VERSION_CODE: ${{ github.run_number }}
@@ -126,6 +614,13 @@ jobs:
           ./gradlew assembleRelease --no-daemon --stacktrace -Dorg.gradle.jvmargs=-Xmx3g
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp app/build/outputs/apk/release/*.apk "$GITHUB_WORKSPACE/out/PdfCraft-${APP_VERSION_NAME}.apk"
+
+      - name: Show the APK (size and signature)
+        continue-on-error: true
+        run: |
+          ls -lh out
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          for f in out/*.apk; do "$apksigner" verify --print-certs "$f" | head -5; done
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
