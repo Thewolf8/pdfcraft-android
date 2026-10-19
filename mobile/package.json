@@ -1,0 +1,16 @@
+{
+  "name": "pdfcraft-android",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Capacitor wrapper that packages the PdfCraft web build (dist/web) as an Android app.",
+  "dependencies": {
+    "@capacitor/android": "^8.4.0",
+    "@capacitor/app": "^8.0.4",
+    "@capacitor/core": "^8.4.0",
+    "@capacitor/filesystem": "^8.1.2",
+    "@capacitor/share": "^8.0.1"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.4.0"
+  }
+}

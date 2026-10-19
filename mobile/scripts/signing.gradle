@@ -1,0 +1,26 @@
+// Applied at the end of android/app/build.gradle by scripts/patch_android.py.
+// Without a keystore the release APK is signed with the debug key, so it installs
+// (an unsigned APK, which is what `assembleRelease` makes by default, does not).
+android {
+    defaultConfig {
+        versionCode = Integer.parseInt(System.getenv('APP_VERSION_CODE') ?: '1')
+        versionName = System.getenv('APP_VERSION_NAME') ?: '0.0.0'
+    }
+    signingConfigs {
+        ci {
+            def ksPath = System.getenv('KEYSTORE_PATH')
+            if (ksPath != null && new File(ksPath).exists()) {
+                storeFile = new File(ksPath)
+                storePassword = System.getenv('KEYSTORE_PASSWORD')
+                keyAlias = System.getenv('KEY_ALIAS')
+                keyPassword = System.getenv('KEY_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            def ksPath = System.getenv('KEYSTORE_PATH')
+            signingConfig = (ksPath != null && new File(ksPath).exists()) ? signingConfigs.ci : signingConfigs.debug
+        }
+    }
+}

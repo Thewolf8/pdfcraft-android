@@ -1,0 +1,8 @@
+{
+  "appId": "app.pdfcraft.android",
+  "appName": "PdfCraft",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  }
+}

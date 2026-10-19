@@ -2,14 +2,164 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Phones: fixed scale (the app has its own zoom), no page zoom or pull-to-refresh. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <meta name="theme-color" content="#f1f1f3" />
     <title>PdfCraft</title>
     <link data-trunk rel="rust" data-wasm-opt="z" />
     <style>
-      html, body { margin: 0; height: 100%; overflow: hidden; background: #f1f1f3; }
-      canvas { width: 100%; height: 100%; display: block; outline: none; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #f1f1f3; overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
+      /* Keep clear of the status/navigation bars and the camera cut-out (Android draws edge to edge). */
+      body {
+        box-sizing: border-box;
+        padding-top: max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
+        padding-right: max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px));
+        padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
+        padding-left: max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px));
+      }
+      canvas { width: 100%; height: 100%; display: block; outline: none; touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
       @media (prefers-color-scheme: dark) { html, body { background: #19191c; } }
     </style>
+    <script>
+      // 1. Phones get `?mobile=1`, which the app reads to draw its controls a little larger.
+      (function () {
+        if (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "") && !/[?&]mobile=/.test(location.search)) {
+          var q = location.search ? location.search + "&mobile=1" : "?mobile=1";
+          history.replaceState(null, "", location.pathname + q + location.hash);
+        }
+      })();
+    </script>
+    <script>
+      // 2. Inside the Android app (Capacitor): the same file flow HomeMed Cabinet uses.
+      //    Save/Export -> written to the cache folder, then the system share sheet ("Save to Files"...).
+      //    "Open with PdfCraft" -> read through the Filesystem plugin and handed to the app as ?file=.
+      //    In a normal browser none of this runs.
+      (function () {
+        var cap = window.Capacitor;
+        if (!cap || !cap.isNativePlatform || !cap.isNativePlatform()) return;
+        function plugin(name) {
+          return (cap.Plugins && cap.Plugins[name]) || (cap.registerPlugin && cap.registerPlugin(name));
+        }
+        var FS = plugin("Filesystem"), Share = plugin("Share"), App = plugin("App");
+        var ar = /^ar/i.test(navigator.language || "");
+        var TEXT = {
+          back: ar ? "اضغط رجوع مرة أخرى للخروج" : "Press back again to exit",
+          open: ar ? "فتح ملف PDF جديد؟ ستضيع التغييرات غير المحفوظة." : "Open this PDF? Unsaved changes will be lost.",
+          fail: ar ? "تعذّر حفظ الملف" : "Could not save the file",
+        };
+
+        function toast(message) {
+          var box = document.createElement("div");
+          box.textContent = message;
+          box.style.cssText =
+            "position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom,0px) + 72px);transform:translateX(-50%);" +
+            "background:#222;color:#fff;padding:10px 16px;border-radius:20px;font:14px sans-serif;z-index:99;" +
+            "max-width:80%;text-align:center;pointer-events:none";
+          document.body.appendChild(box);
+          setTimeout(function () { box.remove(); }, 2200);
+        }
+
+        function bytesFromBase64(b64) {
+          var bin = atob(b64), out = new Uint8Array(bin.length);
+          for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+          return out;
+        }
+        function base64Of(blob) {
+          return new Promise(function (resolve, reject) {
+            var reader = new FileReader();
+            reader.onerror = reject;
+            reader.onloadend = function () {
+              var s = String(reader.result);
+              resolve(s.slice(s.indexOf(",") + 1));
+            };
+            reader.readAsDataURL(blob);
+          });
+        }
+
+        // ---- Save / Export: cache file + share sheet --------------------------------
+        function safeName(name) {
+          return String(name || "document.pdf").replace(/[\\/:*?"<>|]/g, "_") || "document.pdf";
+        }
+        async function saveBlob(name, blob) {
+          name = safeName(name);
+          var CHUNK = 3 * 1024 * 1024; // a multiple of 3: each chunk is valid base64 on its own
+          for (var offset = 0, first = true; first || offset < blob.size; offset += CHUNK) {
+            var data = await base64Of(blob.slice(offset, offset + CHUNK));
+            if (first) await FS.writeFile({ path: name, data: data, directory: "CACHE", recursive: true });
+            else await FS.appendFile({ path: name, data: data, directory: "CACHE" });
+            first = false;
+          }
+          var uri = await FS.getUri({ path: name, directory: "CACHE" });
+          await Share.share({ title: name, url: uri.uri, dialogTitle: name });
+        }
+        var nativeClick = HTMLAnchorElement.prototype.click;
+        HTMLAnchorElement.prototype.click = function () {
+          var a = this;
+          if (a.hasAttribute("download") && a.href && a.href.indexOf("blob:") === 0) {
+            var name = a.getAttribute("download");
+            fetch(a.href)
+              .then(function (r) { return r.blob(); })
+              .then(function (blob) { return saveBlob(name, blob); })
+              .catch(function (e) { console.error("save failed", e); toast(TEXT.fail); });
+            return;
+          }
+          return nativeClick.apply(a, arguments);
+        };
+
+        // ---- Open with PdfCraft ------------------------------------------------------
+        var opened = null; // { name, bytes }
+        function nameFromUrl(url) {
+          try {
+            var last = decodeURIComponent(url.split("?")[0]).split("/").pop();
+            if (/\.pdf$/i.test(last)) return last;
+          } catch (e) { /* opaque content:// id */ }
+          return "document.pdf";
+        }
+        function loadUri(url) {
+          return FS.readFile({ path: url }).then(function (result) {
+            opened = { name: nameFromUrl(url), bytes: bytesFromBase64(String(result.data)) };
+            history.replaceState(null, "", location.pathname + "?mobile=1&file=" + encodeURIComponent("./__open__/" + encodeURIComponent(opened.name)));
+          });
+        }
+
+        var pending = null; // set by a reload that follows an "open with" while the app was running
+        try { pending = sessionStorage.getItem("pdfcraft.open"); sessionStorage.removeItem("pdfcraft.open"); } catch (e) { /* storage off */ }
+        if (/__open__/.test(location.search)) history.replaceState(null, "", location.pathname + "?mobile=1");
+
+        var started = (pending ? Promise.resolve(pending) : App.getLaunchUrl().then(function (r) { return r && r.url; }))
+          .then(function (url) { return url ? loadUri(url) : null; })
+          .catch(function (e) { console.error("open failed", e); });
+        var ready = Promise.race([started, new Promise(function (resolve) { setTimeout(resolve, 4000); })]);
+
+        // The app reads ?file= when it starts, so hold its WebAssembly download until the file is read,
+        // and serve the virtual ./__open__/ URL from memory.
+        var realFetch = window.fetch.bind(window);
+        window.fetch = function (input, init) {
+          var url = typeof input === "string" ? input : (input && (input.url || input.href)) || String(input);
+          if (opened && url.indexOf("/__open__/") !== -1) {
+            return Promise.resolve(new Response(opened.bytes, { status: 200, headers: { "Content-Type": "application/pdf" } }));
+          }
+          if (/\.wasm(\?|#|$)/.test(url)) return ready.then(function () { return realFetch(input, init); });
+          return realFetch(input, init);
+        };
+
+        // A PDF opened from another app while PdfCraft is already running: restart with it.
+        App.addListener("appUrlOpen", function (event) {
+          if (!event || !event.url) return;
+          if (!window.confirm(TEXT.open)) return;
+          try { sessionStorage.setItem("pdfcraft.open", event.url); } catch (e) { /* storage off */ }
+          location.reload();
+        });
+
+        // Accidental back presses must not throw away unsaved work: ask twice.
+        var lastBack = 0;
+        App.addListener("backButton", function () {
+          var now = Date.now();
+          if (now - lastBack < 2000) App.exitApp();
+          else { lastBack = now; toast(TEXT.back); }
+        });
+      })();
+    </script>
   </head>
   <body>
     <canvas id="pdfcraft"></canvas>

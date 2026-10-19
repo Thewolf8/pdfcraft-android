@@ -1,0 +1,144 @@
+diff -ruN a/apps/pdfcraft-web/src/main.rs b/apps/pdfcraft-web/src/main.rs
+--- a/apps/pdfcraft-web/src/main.rs
++++ b/apps/pdfcraft-web/src/main.rs
+@@ -27,6 +27,10 @@
+                     if let Some(json) = cc.storage.and_then(|s| s.get_string("pdfcraft").or_else(|| s.get_string("printcraft"))) {
+                         app.restore(&json);
+                     }
++                    // Phones (the Android app passes `?mobile=1`): a slightly larger interface for fingers.
++                    if is_touch_phone() {
++                        app.system_text_scale = 1.15;
++                    }
+                     // `?file=<url>` opens a PDF from a URL (same-origin or CORS-enabled).
+                     if let Some(url) = query_param("file") {
+                         let inbox = app.startup_inbox.clone();
+@@ -34,6 +38,8 @@
+                         let ctx = cc.egui_ctx.clone();
+                         wasm_bindgen_futures::spawn_local(async move {
+                             let name = url.rsplit('/').next().unwrap_or("document.pdf").split('?').next().unwrap_or("document.pdf").to_string();
++                            // The Android app percent-encodes the file name in the URL (spaces, Arabic, ...).
++                            let name = js_sys::decode_uri_component(&name).ok().map(String::from).unwrap_or(name);
+                             match fetch_bytes(&url).await {
+                                 Ok(bytes) => {
+                                     if let Ok(mut q) = inbox.lock() {
+@@ -104,6 +110,15 @@
+     }
+ }
+ 
++/// `?mobile=1` (set by the Android app and by the page's own phone check), or a narrow window.
++#[cfg(target_arch = "wasm32")]
++fn is_touch_phone() -> bool {
++    if query_param("mobile").as_deref() == Some("1") {
++        return true;
++    }
++    web_sys::window().and_then(|w| w.inner_width().ok()).and_then(|w| w.as_f64()).is_some_and(|w| w < 700.0)
++}
++
+ #[cfg(target_arch = "wasm32")]
+ fn query_param(key: &str) -> Option<String> {
+     let search = web_sys::window()?.location().search().ok()?;
+diff -ruN a/crates/ui-egui/src/docking.rs b/crates/ui-egui/src/docking.rs
+--- a/crates/ui-egui/src/docking.rs
++++ b/crates/ui-egui/src/docking.rs
+@@ -396,6 +396,38 @@
+         // Availability is a render projection: the saved group, selection and width survive Home.
+         let _ = rendered.apply(Action::Close { panel: Panel::Inspector });
+     }
++    // Phones: with no room for panes side by side, the open Tools or Inspector pane becomes a
++    // sheet under the document (drag its top edge to resize) instead of a column beside it.
++    if ui.available_width() < COMPACT_WIDTH {
++        let sheet = if app.active.is_some() && rendered.contains(&Panel::Inspector) {
++            Some(Panel::Inspector)
++        } else if rendered.contains(&Panel::Tools) {
++            Some(Panel::Tools)
++        } else {
++            None
++        };
++        if let Some(panel) = sheet {
++            egui::Panel::bottom("pdfcraft-compact-sheet")
++                .resizable(true)
++                .default_size(300.0)
++                .size_range(140.0..=560.0)
++                .frame(egui::Frame::NONE.fill(t.panel))
++                .show(ui, |ui| {
++                    if panel == Panel::Inspector {
++                        ui.data_mut(|data| data.insert_temp(egui::Id::new("pdfcraft-inspector-body"), ui.max_rect()));
++                        crate::panels::right_panel(app, ui);
++                    } else {
++                        crate::panels::left_panel(app, ui);
++                    }
++                });
++        }
++        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| canvas_body(app, ui, t.pasteboard));
++        let _ = sync(&mut workspace, app);
++        drain_reveals(&mut workspace, app);
++        publish_visibility(app, &workspace);
++        app.docking = workspace;
++        return;
++    }
+     let output = DockArea::new(egui::Id::new("pdfcraft-docking")).show_with_limits(
+         ui,
+         &rendered,
+@@ -404,17 +436,7 @@
+         permissions,
+         panel_limits,
+         |ui, panel| match panel {
+-            Panel::Canvas => {
+-                ui.painter().rect_filled(ui.max_rect(), 0.0, t.pasteboard);
+-                match app.active {
+-                    None if app.combine_showing() => crate::combine_ui::page(app, ui),
+-                    None => crate::home::show(app, ui),
+-                    Some(index) => match crate::compare_ui::side_by_side(app, index) {
+-                        Some((old, new)) => crate::compare_ui::compare_area(app, old, new, ui),
+-                        None => crate::canvas::document_area(app, index, ui),
+-                    },
+-                }
+-            }
++            Panel::Canvas => canvas_body(app, ui, t.pasteboard),
+             Panel::Tools => crate::panels::left_panel(app, ui),
+             Panel::Inspector => {
+                 ui.data_mut(|data| data.insert_temp(egui::Id::new("pdfcraft-inspector-body"), ui.max_rect()));
+@@ -441,6 +463,23 @@
+     }
+ }
+ 
++/// Windows narrower than this (in points) get the phone layout: one pane at a time, with Tools
++/// and the Inspector as a sheet under the document.
++pub const COMPACT_WIDTH: f32 = 700.0;
++
++/// The document area: the open document, Home, or the Combine page.
++fn canvas_body(app: &mut crate::PdfCraftApp, ui: &mut egui::Ui, pasteboard: egui::Color32) {
++    ui.painter().rect_filled(ui.max_rect(), 0.0, pasteboard);
++    match app.active {
++        None if app.combine_showing() => crate::combine_ui::page(app, ui),
++        None => crate::home::show(app, ui),
++        Some(index) => match crate::compare_ui::side_by_side(app, index) {
++            Some((old, new)) => crate::compare_ui::compare_area(app, old, new, ui),
++            None => crate::canvas::document_area(app, index, ui),
++        },
++    }
++}
++
+ fn panel_limits(panel: &Panel) -> PanelLimits {
+     let (min, max_width) = match panel {
+         Panel::Canvas => (egui::vec2(160.0, 160.0), 1_000_000.0),
+diff -ruN a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -3162,7 +3162,15 @@
+             // Read mode hides the tools, not the navigation panes: the rail stays visible
+             // there, so its buttons (Bookmarks, Page thumbnails, ...) must open their panels.
+             // Outside Read mode the docking workspace draws the inspector.
+-            if self.mode == Mode::Read && self.right.is_some() {
++            if self.mode == Mode::Read && self.right.is_some() && ui.available_width() < docking::COMPACT_WIDTH {
++                // Phone: the pane is a sheet under the page, not a column beside it.
++                egui::Panel::bottom("read_right_sheet")
++                    .resizable(true)
++                    .default_size(300.0)
++                    .size_range(140.0..=560.0)
++                    .frame(egui::Frame::NONE)
++                    .show(ui, |ui| panels::right_panel(self, ui));
++            } else if self.mode == Mode::Read && self.right.is_some() {
+                 egui::Panel::right("read_right_panel")
+                     .resizable(true)
+                     .default_size(330.0)
