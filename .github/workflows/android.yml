@@ -118,6 +118,9 @@ jobs:
           Exact-text edits: if the sources changed and a piece is not found, nothing is written and the build falls back to the stock UI."""
           import sys
 
+          TIER = sys.argv[1] if len(sys.argv) > 1 else "all"  # "layout" = panes; "bar" = + top bar; "all" = + touch spacing and lighter page rasters
+          assert TIER in ("layout", "bar", "all"), TIER
+
 
           def edit(path, pairs):
               with open(path, encoding="utf-8") as f:
@@ -218,12 +221,103 @@ jobs:
                       } else if self.mode == Mode::Read && self.right.is_some() {
                           egui::Panel::right("read_right_panel")"""
 
+          CHROME = "crates/ui-egui/src/chrome.rs"
+          BAR_HEAD_OLD = """        .show(ui, |ui| {
+                      ui.horizontal_centered(|ui| {
+                          ui.spacing_mut().item_spacing.x = 2.0;
+                          main_menu(app, ui);"""
+          BAR_HEAD_NEW = """        .show(ui, |ui| {
+                      let mut row = |ui: &mut egui::Ui| {
+                          ui.horizontal_centered(|ui| {
+                          ui.spacing_mut().item_spacing.x = 2.0;
+                          main_menu(app, ui);"""
+          BAR_LAYOUT_OLD = "                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {\n                    ui.spacing_mut().item_spacing.x = 4.0;\n                    let has_doc = app.active.is_some();"
+          BAR_LAYOUT_NEW = "                ui.with_layout(if compact { Layout::left_to_right(Align::Center) } else { Layout::right_to_left(Align::Center) }, |ui| {\n                    ui.spacing_mut().item_spacing.x = 4.0;\n                    let has_doc = app.active.is_some();"
+          BAR_TAIL_OLD = """                    if widgets::search_box(ui, tl!("Find tools and commands"), 260.0).clicked() {
+                                  app.palette_open = true;
+                              }
+                          });
+                      });
+                  });
+          }"""
+          BAR_TAIL_NEW = """                    let open_palette = if compact {
+                                  icons::button(ui, "search", 32.0, false, tl!("Find tools and commands")).clicked()
+                              } else {
+                                  widgets::search_box(ui, tl!("Find tools and commands"), 260.0).clicked()
+                              };
+                              if open_palette {
+                                  app.palette_open = true;
+                              }
+                          });
+                      });
+                      };
+                      // Phone: the bar is wider than the screen, so it scrolls sideways (the search box is an icon).
+                      if compact {
+                          egui::ScrollArea::horizontal()
+                              .id_salt("mode_bar_scroll")
+                              .auto_shrink([false, false])
+                              .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                              .show(ui, |ui| row(ui));
+                      } else {
+                          row(ui);
+                      }
+                  });
+          }"""
+          BAR_FN_OLD = """pub fn mode_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
+              let t = Tokens::get(ui.ctx());"""
+          BAR_FN_NEW = BAR_FN_OLD + """
+              let compact = ui.available_width() < crate::docking::COMPACT_WIDTH;"""
+
+          THEME = "crates/ui-egui/src/theme.rs"
+          CANVAS = "crates/ui-egui/src/canvas.rs"
+          THEME_FN_OLD = "pub fn apply(ctx: &egui::Context, kind: ThemeKind) {"
+          THEME_FN_NEW = """/// True on a phone: the web app sets this flag before the first frame.
+          pub fn is_touch(ctx: &egui::Context) -> bool {
+              ctx.data(|d| d.get_temp::<bool>(egui::Id::new("pdfcraft-touch"))).unwrap_or(false)
+          }
+
+          """ + THEME_FN_OLD
+          THEME_STYLE_OLD = """    ctx.global_style_mut(|s| {
+                  s.spacing.item_spacing = egui::vec2(8.0, 6.0);"""
+          THEME_STYLE_NEW = """    let touch = is_touch(ctx);
+              ctx.global_style_mut(|s| {
+                  s.spacing.item_spacing = egui::vec2(8.0, 6.0);"""
+          THEME_TAIL_OLD = """        s.interaction.tooltip_delay = 0.35;
+              });"""
+          THEME_TAIL_NEW = """        s.interaction.tooltip_delay = 0.35;
+                  // Phones: roomier rows and buttons for fingers.
+                  if touch {
+                      s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+                      s.spacing.button_padding = egui::vec2(12.0, 8.0);
+                      s.spacing.interact_size.y = s.spacing.interact_size.y.max(34.0);
+                      s.spacing.scroll.floating_width = 4.0;
+                  }
+              });"""
+          RASTER_OLD = """    let ppp = ui.ctx().pixels_per_point();
+              let scale = view.render_scale(ppp);
+              let tag = scale_tag(scale);"""
+          RASTER_NEW = """    let ppp = ui.ctx().pixels_per_point();
+              // Phones: page rasters use at most 2 pixels per point. The CPU renderer's cost grows with the
+              // square of this, and at 3x the extra sharpness is barely visible.
+              let raster_ppp = if crate::theme::is_touch(ui.ctx()) { ppp.min(2.0) } else { ppp };
+              let scale = view.render_scale(raster_ppp);
+              let tag = scale_tag(scale);"""
+          TEXEL1_OLD = "xf.texel_aligned(p.tex.size(), ppp).paint_image(painter, p.tex.id(), 0.0, 0.0, 1.0, 1.0);"
+          TEXEL2_OLD = "xf.texel_aligned([dw as usize, dh as usize], ppp).paint_image("
+
+          TOUCH_FLAG = (
+              """                        cc.egui_ctx.data_mut(|d| d.insert_temp(eframe::egui::Id::new("pdfcraft-touch"), true));
+          """
+              if TIER == "all"
+              else ""
+          )
+
           out = {
               MAIN: edit(MAIN, [
                   (RESTORE, RESTORE + """                    // Phones (the Android app passes `?mobile=1`): a slightly larger interface for fingers.
                               if is_touch_phone() {
                                   app.system_text_scale = 1.15;
-                              }
+          """ + TOUCH_FLAG + """                    }
           """),
                   (QUERY, """/// `?mobile=1` (set by the Android app and by the page's own phone check), or a narrow window.
           #[cfg(target_arch = "wasm32")]
@@ -246,14 +340,27 @@ jobs:
               ]),
               LIB: edit(LIB, [(READ_OLD, READ_NEW)]),
           }
+          if TIER == "all":
+              out[THEME] = edit(THEME, [(THEME_FN_OLD, THEME_FN_NEW), (THEME_STYLE_OLD, THEME_STYLE_NEW), (THEME_TAIL_OLD, THEME_TAIL_NEW)])
+              out[CANVAS] = edit(
+                  CANVAS,
+                  [
+                      (RASTER_OLD, RASTER_NEW),
+                      (TEXEL1_OLD, TEXEL1_OLD.replace("ppp)", "raster_ppp)")),
+                      (TEXEL2_OLD, TEXEL2_OLD.replace("ppp)", "raster_ppp)")),
+                  ],
+              )
+          if TIER in ("bar", "all"):
+              out[CHROME] = edit(CHROME, [(BAR_FN_OLD, BAR_FN_NEW), (BAR_HEAD_OLD, BAR_HEAD_NEW), (BAR_LAYOUT_OLD, BAR_LAYOUT_NEW), (BAR_TAIL_OLD, BAR_TAIL_NEW)])
           for path, text in out.items():
               with open(path, "w", encoding="utf-8") as f:
                   f.write(text)
-          print("ui_patch: phone layout applied to %d files" % len(out))
+          print("ui_patch (%s): applied to %d files" % (TIER, len(out)))
           __PDFCRAFT_EOF__
           cat > mobile-ci/web_patch.py <<'__PDFCRAFT_EOF__'
           #!/usr/bin/env python3
           """Adds the phone/Android glue (mobile-ci/glue.html) to the web page (run from the repository root)."""
+          import os
           import re
           import sys
 
@@ -272,6 +379,11 @@ jobs:
               page,
               count=1,
           )
+          # The page asks wasm-opt to optimise for size (-Oz); on a phone, speed matters more.
+          wasm_opt = 'data-wasm-opt="3"'
+          if os.environ.get("SIMD") == "1":
+              wasm_opt += ' data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-simd"'
+          page = page.replace('data-wasm-opt="z"', wasm_opt)
           page = page.replace("</head>", glue.rstrip() + "\n  </head>", 1)
           with open(PAGE, "w", encoding="utf-8") as f:
               f.write(page)
@@ -529,27 +641,49 @@ jobs:
             cargo install trunk --locked
           fi
 
-      # The phone layout (Tools/Inspector as a bottom sheet, larger controls) edits the Rust sources.
-      # If the sources changed so much that it no longer fits or compiles, the stock UI is built instead
-      # (the Android glue, which is plain HTML/JS, is kept either way).
-      - name: Build web app (phone UI)
-        id: web_phone
-        continue-on-error: true
+      # The phone UI edits the Rust sources. A fast `cargo check` picks the richest set of edits that
+      # compiles (all > top bar > panes only), so one broken piece never costs the others; if none
+      # compiles, the stock UI is built. The Android glue (plain HTML/JS) is kept in every case.
+      - name: Choose the phone UI (cargo check)
+        id: ui
         run: |
-          python3 mobile-ci/ui_patch.py
+          tier=stock
+          for t in all bar layout; do
+            git checkout -- .
+            if python3 mobile-ci/ui_patch.py "$t" && (cd apps/pdfcraft-web && cargo check --target wasm32-unknown-unknown); then
+              tier=$t
+              break
+            fi
+            echo "::warning::Phone UI set '$t' did not compile (see this step's log for the error)."
+          done
+          if [ "$tier" = stock ]; then git checkout -- .; fi
+          echo "tier=$tier" >> "$GITHUB_OUTPUT"
+          echo "### Phone UI: $tier" >> "$GITHUB_STEP_SUMMARY"
+
+      # WebAssembly SIMD makes the page renderer several times faster on phones (Chrome 91+). If the
+      # toolchain rejects it, the same build is repeated without it.
+      - name: Build web app (fast, WebAssembly SIMD)
+        id: web_simd
+        continue-on-error: true
+        env:
+          SIMD: "1"
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: "-C target-feature=+simd128"
+        run: |
           python3 mobile-ci/web_patch.py
           cd apps/pdfcraft-web
           trunk build --release
+          echo "### Web build: SIMD (fast)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build web app (fallback, stock UI)
-        if: steps.web_phone.outcome == 'failure'
+      - name: Build web app (standard, no SIMD)
+        if: steps.web_simd.outcome == 'failure'
         run: |
-          echo "::warning::The phone UI did not build (see the step above); building the stock UI instead."
-          git checkout -- .
+          echo "::warning::The SIMD build failed (see the step above); building without SIMD."
+          git checkout -- apps/pdfcraft-web/index.html
           rm -rf dist
           python3 mobile-ci/web_patch.py
           cd apps/pdfcraft-web
           trunk build --release
+          echo "### Web build: standard (no SIMD)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check the web build
         run: |
