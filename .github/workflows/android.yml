@@ -18,6 +18,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
+    inputs:
+      ui_language:
+        description: "Interface language: ar (default), en, fr, de, tr ... or auto to follow the phone"
+        default: "ar"
+        required: false
 
 permissions:
   contents: write
@@ -28,6 +33,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  UI_LANG: ${{ github.event.inputs.ui_language || 'ar' }}
 
 defaults:
   run:
@@ -41,6 +47,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # The Arabic (and Hebrew, Thai, Telugu, Japanese) interface fonts are an optional build input, as in the
+      # project's own CI. Without them the Arabic interface would show empty boxes.
+      - name: Check out craft-fonts (interface fonts)
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: storytold/craft-fonts
+          ref: 3d9ab3a132ed0eff457e424226a435a901da30d3
+          path: craft-fonts
+
+      - name: Use craft-fonts for the build
+        run: |
+          if [ -f craft-fonts/fonts/manifest.txt ]; then
+            echo "CRAFT_FONTS_DIR=$GITHUB_WORKSPACE/craft-fonts" >> "$GITHUB_ENV"
+            echo "### Fonts: craft-fonts embedded (Arabic interface available); UI language: ${UI_LANG}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::craft-fonts could not be checked out: the Arabic interface would show empty boxes."
+          fi
 
       - name: Check the PdfCraft sources are in the repository
         run: |
@@ -489,6 +514,17 @@ jobs:
           if os.environ.get("SIMD") == "1":
               wasm_opt += ' data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-simd"'
           page = page.replace('data-wasm-opt="z"', wasm_opt)
+          # Interface language (UI_LANG, e.g. "ar"): the app follows navigator.languages while its Language
+          # preference is "Auto", so put the chosen language first. A language picked in Preferences still wins.
+          lang = os.environ.get("UI_LANG", "").strip()
+          if re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*", lang) and lang.lower() != "auto":
+              glue = glue.replace(
+                  "<!-- pdfcraft-mobile-glue -->",
+                  "<!-- pdfcraft-mobile-glue -->\n    <script>(function(){var l=%r,o=Array.prototype.slice.call(navigator.languages||[]);"
+                  "try{Object.defineProperty(navigator,'languages',{get:function(){return [l].concat(o.filter(function(x){return String(x).slice(0,2).toLowerCase()!==l.slice(0,2).toLowerCase();}));},configurable:true});"
+                  "Object.defineProperty(navigator,'language',{get:function(){return l;},configurable:true});}catch(e){}})();</script>" % lang,
+                  1,
+              )
           page = page.replace("</head>", glue.rstrip() + "\n  </head>", 1)
           with open(PAGE, "w", encoding="utf-8") as f:
               f.write(page)
