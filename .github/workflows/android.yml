@@ -116,15 +116,24 @@ jobs:
           #!/usr/bin/env python3
           """Phone layout for the egui UI (run from the repository root).
           Exact-text edits: if the sources changed and a piece is not found, nothing is written and the build falls back to the stock UI."""
+          import glob
+          import re
           import sys
 
-          TIER = sys.argv[1] if len(sys.argv) > 1 else "all"  # "layout" = panes; "bar" = + top bar; "all" = + touch spacing and lighter page rasters
-          assert TIER in ("layout", "bar", "all"), TIER
+          # Cumulative sets of edits: "layout" = panes; "bar" = + top bar, popups that fit the screen, page gutter;
+          # "all" = + touch spacing and lighter page rasters; "read" = + full-screen reading mode.
+          TIERS = ("layout", "bar", "all", "read")
+          TIER = sys.argv[1] if len(sys.argv) > 1 else "read"
+          assert TIER in TIERS, TIER
+          RANK = TIERS.index(TIER)
 
 
           def edit(path, pairs):
               with open(path, encoding="utf-8") as f:
-                  text = f.read()
+                  return edit_text(f.read(), path, pairs)
+
+
+          def edit_text(text, path, pairs):
               for old, new in pairs:
                   if text.count(old) != 1:
                       sys.exit("ui_patch: text not found exactly once in %s:\n%s" % (path, old[:160]))
@@ -305,10 +314,99 @@ jobs:
           TEXEL1_OLD = "xf.texel_aligned(p.tex.size(), ppp).paint_image(painter, p.tex.id(), 0.0, 0.0, 1.0, 1.0);"
           TEXEL2_OLD = "xf.texel_aligned([dw as usize, dh as usize], ppp).paint_image("
 
+          # Pages keep a gutter of 70 points on each side (room for the floating tool bar on a desktop). On a phone
+          # that is half the screen, so the gutter shrinks to 4 points.
+          SIDE_FN_OLD = "    fn fit_zoom(&mut self, info: &DocInfo) {"
+          SIDE_FN_NEW = """    /// Gutter on each side of the pages; tiny on a phone so a page fills the width.
+              fn side(&self) -> f32 {
+                  if self.viewport_w < 700.0 { 4.0 } else { SIDE }
+              }
+
+          """ + SIDE_FN_OLD
+          SIDE_PAIRS = [
+              (SIDE_FN_OLD, SIDE_FN_NEW),
+              ("let corner = vec2(SIDE, 0.0);", "let corner = vec2(self.side(), 0.0);"),
+              ("let avail_w = (self.viewport_w - 2.0 * SIDE).max(100.0);", "let avail_w = (self.viewport_w - 2.0 * self.side()).max(100.0);"),
+              ("(max_w * self.zoom * PT * per_row + 2.0 * SIDE).max(avail_w)", "(max_w * self.zoom * PT * per_row + 2.0 * self.side()).max(avail_w)"),
+              ("pos2(((content_w - size.x) / 2.0).max(SIDE), y)", "pos2(((content_w - size.x) / 2.0).max(self.side()), y)"),
+              (
+                  "(content_w / 2.0 + GAP / 2.0).max(SIDE) } else { ((content_w - row_w) / 2.0).max(SIDE) }",
+                  "(content_w / 2.0 + GAP / 2.0).max(self.side()) } else { ((content_w - row_w) / 2.0).max(self.side()) }",
+              ),
+              ("let (left, right) = (r.left() - SIDE, r.right() + SIDE);", "let (left, right) = (r.left() - view.side(), r.right() + view.side());"),
+          ]
+
+
+          def widened():
+              """Popups and dialogs with a fixed width wider than a phone screen: clip them to the screen."""
+              changed = {}
+              pattern = re.compile(r"\bui\.set_width\((\d{3,4})\.0\)")
+              for path in sorted(glob.glob("crates/ui-egui/src/*.rs")):
+                  with open(path, encoding="utf-8") as f:
+                      text = f.read()
+                  fixed = pattern.sub(
+                      lambda m: "ui.set_width(%s.0_f32.min(ui.ctx().content_rect().width() - 64.0))" % m.group(1) if int(m.group(1)) >= 300 else m.group(0),
+                      text,
+                  )
+                  if fixed != text:
+                      changed[path] = fixed
+              return changed
+
+
+          READING_FNS_OLD = "impl PdfCraftApp {\n    fn finish_render_frame(&mut self, ctx: &egui::Context) {"
+          READING_FNS_NEW = """/// Full-screen reading (phones): the bars hide so the page fills the screen.
+          pub(crate) fn is_reading(ctx: &egui::Context) -> bool {
+              ctx.data(|d| d.get_temp::<bool>(egui::Id::new("pdfcraft-reading"))).unwrap_or(false)
+          }
+
+          pub(crate) fn set_reading(ctx: &egui::Context, on: bool) {
+              ctx.data_mut(|d| d.insert_temp(egui::Id::new("pdfcraft-reading"), on));
+              ctx.request_repaint();
+          }
+
+          """ + READING_FNS_OLD
+          READING_CHROME_OLD = """        chrome::tab_strip(self, ui);
+                  chrome::mode_bar(self, ui);
+                  if self.active.is_some() {
+                      chrome::right_rail(self, ui);"""
+          READING_CHROME_NEW = """        if is_reading(&ctx) && self.active.is_none() {
+                      set_reading(&ctx, false);
+                  }
+                  let reading = is_reading(&ctx);
+                  if reading {
+                      self.right = None;
+                  } else {
+                      chrome::tab_strip(self, ui);
+                      chrome::mode_bar(self, ui);
+                  }
+                  if self.active.is_some() && !reading {
+                      chrome::right_rail(self, ui);"""
+          READING_EXIT_OLD = """        self.process_pending_edits();
+                  palette::show(self, &ctx);"""
+          READING_EXIT_NEW = """        if reading {
+                      egui::Area::new(egui::Id::new("reading-exit"))
+                          .order(egui::Order::Foreground)
+                          .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+                          .show(&ctx, |ui| {
+                              egui::Frame::NONE.fill(t.chrome.gamma_multiply(0.9)).corner_radius(egui::CornerRadius::same(18)).show(ui, |ui| {
+                                  if icons::button(ui, "minimize-2", 36.0, false, "Exit full screen").clicked() {
+                                      set_reading(&ctx, false);
+                                  }
+                              });
+                          });
+                  }
+          """ + READING_EXIT_OLD
+          READING_BAR_OLD = """                        icons::button(ui, "search", 32.0, false, tl!("Find tools and commands")).clicked()"""
+          READING_BAR_NEW = """                        if app.active.is_some() && icons::button(ui, "book-open", 32.0, false, "Full screen reading").clicked() {
+                                      app.switch_mode(Mode::Read, true);
+                                      crate::set_reading(ui.ctx(), true);
+                                  }
+          """ + READING_BAR_OLD
+
           TOUCH_FLAG = (
               """                        cc.egui_ctx.data_mut(|d| d.insert_temp(eframe::egui::Id::new("pdfcraft-touch"), true));
           """
-              if TIER == "all"
+              if RANK >= 2
               else ""
           )
 
@@ -340,18 +438,25 @@ jobs:
               ]),
               LIB: edit(LIB, [(READ_OLD, READ_NEW)]),
           }
-          if TIER == "all":
-              out[THEME] = edit(THEME, [(THEME_FN_OLD, THEME_FN_NEW), (THEME_STYLE_OLD, THEME_STYLE_NEW), (THEME_TAIL_OLD, THEME_TAIL_NEW)])
-              out[CANVAS] = edit(
-                  CANVAS,
-                  [
-                      (RASTER_OLD, RASTER_NEW),
-                      (TEXEL1_OLD, TEXEL1_OLD.replace("ppp)", "raster_ppp)")),
-                      (TEXEL2_OLD, TEXEL2_OLD.replace("ppp)", "raster_ppp)")),
-                  ],
-              )
-          if TIER in ("bar", "all"):
+          if RANK >= 1:
               out[CHROME] = edit(CHROME, [(BAR_FN_OLD, BAR_FN_NEW), (BAR_HEAD_OLD, BAR_HEAD_NEW), (BAR_LAYOUT_OLD, BAR_LAYOUT_NEW), (BAR_TAIL_OLD, BAR_TAIL_NEW)])
+              canvas_pairs = list(SIDE_PAIRS)
+          if RANK >= 2:
+              out[THEME] = edit(THEME, [(THEME_FN_OLD, THEME_FN_NEW), (THEME_STYLE_OLD, THEME_STYLE_NEW), (THEME_TAIL_OLD, THEME_TAIL_NEW)])
+              canvas_pairs += [
+                  (RASTER_OLD, RASTER_NEW),
+                  (TEXEL1_OLD, TEXEL1_OLD.replace("ppp)", "raster_ppp)")),
+                  (TEXEL2_OLD, TEXEL2_OLD.replace("ppp)", "raster_ppp)")),
+              ]
+          if RANK >= 1:
+              out[CANVAS] = edit(CANVAS, canvas_pairs)
+              for path, text in widened().items():
+                  if path in out:  # (none of the width files is edited above, but stay safe)
+                      sys.exit("ui_patch: unexpected double edit of " + path)
+                  out[path] = text
+          if RANK >= 3:
+              out[LIB] = edit_text(out[LIB], LIB, [(READING_FNS_OLD, READING_FNS_NEW), (READING_CHROME_OLD, READING_CHROME_NEW), (READING_EXIT_OLD, READING_EXIT_NEW)])
+              out[CHROME] = edit_text(out[CHROME], CHROME, [(READING_BAR_OLD, READING_BAR_NEW)])
           for path, text in out.items():
               with open(path, "w", encoding="utf-8") as f:
                   f.write(text)
@@ -642,13 +747,13 @@ jobs:
           fi
 
       # The phone UI edits the Rust sources. A fast `cargo check` picks the richest set of edits that
-      # compiles (all > top bar > panes only), so one broken piece never costs the others; if none
+      # compiles (read > all > bar > layout), so one broken piece never costs the others; if none
       # compiles, the stock UI is built. The Android glue (plain HTML/JS) is kept in every case.
       - name: Choose the phone UI (cargo check)
         id: ui
         run: |
           tier=stock
-          for t in all bar layout; do
+          for t in read all bar layout; do
             git checkout -- .
             if python3 mobile-ci/ui_patch.py "$t" && (cd apps/pdfcraft-web && cargo check --target wasm32-unknown-unknown); then
               tier=$t
