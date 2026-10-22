@@ -20,8 +20,8 @@ on:
   workflow_dispatch:
     inputs:
       ui_language:
-        description: "Interface language: ar (default), en, fr, de, tr ... or auto to follow the phone"
-        default: "ar"
+        description: "Interface language: auto (default, follows the phone), or ar, en, fr, de, tr ..."
+        default: "auto"
         required: false
 
 permissions:
@@ -33,7 +33,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  UI_LANG: ${{ github.event.inputs.ui_language || 'ar' }}
+  UI_LANG: ${{ github.event.inputs.ui_language || 'auto' }}
 
 defaults:
   run:
@@ -146,9 +146,10 @@ jobs:
           import sys
 
           # Cumulative sets of edits: "layout" = panes; "bar" = + top bar, popups that fit the screen, page gutter;
-          # "all" = + touch spacing and lighter page rasters; "read" = + full-screen reading mode.
-          TIERS = ("layout", "bar", "all", "read")
-          TIER = sys.argv[1] if len(sys.argv) > 1 else "read"
+          # "all" = + touch spacing and lighter page rasters; "read" = + full-screen reading mode;
+          # "more" = + scrolling hand by default, scrolling top bar, dialogs that fit, pages that touch in reading mode.
+          TIERS = ("layout", "bar", "all", "read", "more")
+          TIER = sys.argv[1] if len(sys.argv) > 1 else "more"
           assert TIER in TIERS, TIER
           RANK = TIERS.index(TIER)
 
@@ -348,6 +349,32 @@ jobs:
               }
 
           """ + SIDE_FN_OLD
+          GAP_ANCHOR_OLD = "const GAP: f32 = 14.0;"
+          GAP_ANCHOR_NEW = GAP_ANCHOR_OLD + """
+
+          /// Set by full-screen reading: pages touch each other.
+          static TIGHT_PAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+          pub(crate) fn set_tight_pages(on: bool) {
+              TIGHT_PAGES.store(on, std::sync::atomic::Ordering::Relaxed);
+          }"""
+          GAP_FN_NEW = """    /// Gap between pages; none in full-screen reading, so the pages run together.
+              fn gap(&self) -> f32 {
+                  if TIGHT_PAGES.load(std::sync::atomic::Ordering::Relaxed) { 0.0 } else { GAP }
+              }
+
+          """ + SIDE_FN_OLD
+          GAP_PAIRS = [
+              (SIDE_FN_OLD, GAP_FN_NEW),
+              (GAP_ANCHOR_OLD, GAP_ANCHOR_NEW),
+              ("(content_w / 2.0 + GAP / 2.0).max(self.side())", "(content_w / 2.0 + self.gap() / 2.0).max(self.side())"),
+              ("Fit::Width => self.zoom = (avail_w - GAP * (per_row - 1.0)) / (w * PT * per_row),", "Fit::Width => self.zoom = (avail_w - self.gap() * (per_row - 1.0)) / (w * PT * per_row),"),
+              ("let zw = (avail_w - GAP * (per_row - 1.0)) / (w * PT * per_row);", "let zw = (avail_w - self.gap() * (per_row - 1.0)) / (w * PT * per_row);"),
+              ("y += size.y + GAP;", "y += size.y + self.gap();"),
+              ("let row_w: f32 = sizes.iter().map(|v| v.x).sum::<f32>() + GAP * (sizes.len() as f32 - 1.0);", "let row_w: f32 = sizes.iter().map(|v| v.x).sum::<f32>() + self.gap() * (sizes.len() as f32 - 1.0);"),
+              ("x += size.x + GAP;", "x += size.x + self.gap();"),
+              ("y += row_h + GAP;", "y += row_h + self.gap();"),
+          ]
           SIDE_PAIRS = [
               (SIDE_FN_OLD, SIDE_FN_NEW),
               ("let corner = vec2(SIDE, 0.0);", "let corner = vec2(self.side(), 0.0);"),
@@ -377,6 +404,128 @@ jobs:
                       changed[path] = fixed
               return changed
 
+
+          TAB_FN_OLD = """pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
+              let t = Tokens::get(ui.ctx());"""
+          TAB_FN_NEW = TAB_FN_OLD + """
+              let compact = ui.available_width() < crate::docking::COMPACT_WIDTH;"""
+          TAB_HEAD_OLD = """            ui.horizontal_centered(|ui| {
+                          ui.spacing_mut().item_spacing.x = 4.0;
+                          if !controls.left.is_empty() {"""
+          TAB_HEAD_NEW = """            let mut row = |ui: &mut egui::Ui| {
+                      ui.horizontal_centered(|ui| {
+                          ui.spacing_mut().item_spacing.x = 4.0;
+                          if !controls.left.is_empty() {"""
+          TAB_WIDTH_OLD = "                    + 2.0 * button\n                    + 50.0\n"
+          TAB_WIDTH_NEW = "                    + 3.0 * button\n                    + 50.0\n"
+          TAB_TABS_OLD = "                let mut tabs_width = (ui.available_width() - controls_width - open_width).max(0.0);"
+          TAB_TABS_NEW = "                let mut tabs_width = if compact { 10_000.0 } else { (ui.available_width() - controls_width - open_width).max(0.0) };"
+          TAB_LAYOUT_OLD = """                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                              if !controls.right.is_empty() {"""
+          TAB_LAYOUT_NEW = """                ui.with_layout(if compact { Layout::left_to_right(Align::Center) } else { Layout::right_to_left(Align::Center) }, |ui| {
+                              if !controls.right.is_empty() {"""
+          TAB_LANG_OLD = """                    if icons::button(ui, "circle-help", button, false, tl!("Keyboard shortcuts")).clicked() {"""
+          TAB_LANG_NEW = """                    if icons::button(ui, "languages", button, false, tl!("Language")).clicked() {
+                                  app.dialog = Some(Dialog::Preferences);
+                              }
+          """ + TAB_LANG_OLD
+          TAB_TAIL_OLD = """                    if widgets::ghost_button_sized(ui, "messages-square", "Discord", tab_h).on_hover_text(pdfcraft_engine::links::DISCORD).clicked() {
+                                  app.execute("help.discord");
+                              }
+                          });
+                      });
+                  });
+          }"""
+          TAB_TAIL_NEW = """                    if widgets::ghost_button_sized(ui, "messages-square", "Discord", tab_h).on_hover_text(pdfcraft_engine::links::DISCORD).clicked() {
+                                  app.execute("help.discord");
+                              }
+                          });
+                      });
+                      };
+                      // Phone: the whole strip scrolls sideways instead of its buttons overlapping.
+                      if compact {
+                          egui::ScrollArea::horizontal()
+                              .id_salt("tab_strip_scroll")
+                              .auto_shrink([false, false])
+                              .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                              .show(ui, |ui| row(ui));
+                      } else {
+                          row(ui);
+                      }
+                  });
+          }"""
+          TAB_PAIRS = [
+              (TAB_FN_OLD, TAB_FN_NEW), (TAB_HEAD_OLD, TAB_HEAD_NEW), (TAB_WIDTH_OLD, TAB_WIDTH_NEW), (TAB_TABS_OLD, TAB_TABS_NEW),
+              (TAB_LAYOUT_OLD, TAB_LAYOUT_NEW), (TAB_LANG_OLD, TAB_LANG_NEW), (TAB_TAIL_OLD, TAB_TAIL_NEW),
+          ]
+
+          DIALOGS = "crates/ui-egui/src/dialogs.rs"
+          WIDGETS = "crates/ui-egui/src/widgets.rs"
+          DIALOG_W_OLD = """        ui.set_width(match dialog {
+                      Dialog::Properties(_) => 640.0,
+                      Dialog::Print => 820.0,
+                      Dialog::FieldProps | Dialog::BulkFieldProps => 600.0,
+                      Dialog::About => 780.0,
+                      _ => 520.0,
+                  });"""
+          DIALOG_W_NEW = """        let dialog_w: f32 = match dialog {
+                      Dialog::Properties(_) => 640.0,
+                      Dialog::Print => 820.0,
+                      Dialog::FieldProps | Dialog::BulkFieldProps => 600.0,
+                      Dialog::About => 780.0,
+                      _ => 520.0,
+                  };
+                  ui.set_width(dialog_w.min(ui.ctx().content_rect().width() - 64.0));"""
+          FIELD_OLD = "ui.add(widgets::line(v).desired_width(420.0).background_color(t.field).id_salt((\"info\", *k)))"
+          FIELD_NEW = "ui.add(widgets::line(v).desired_width(420.0_f32.min(ui.available_width())).background_color(t.field).id_salt((\"info\", *k)))"
+          MODAL_OLD = """        begin_dialog(ui);
+                  let inner = content(ui);"""
+          MODAL_NEW = """        begin_dialog(ui);
+                  let inner = if ui.ctx().content_rect().width() < crate::docking::COMPACT_WIDTH {
+                      // Phone: a dialog larger than the screen scrolls instead of running off it.
+                      let max_h = (ui.ctx().content_rect().height() - 96.0).max(200.0);
+                      egui::ScrollArea::both().max_height(max_h).auto_shrink([true, true]).show(ui, |ui| content(ui)).inner
+                  } else {
+                      content(ui)
+                  };"""
+          EXTRA_PAIRS = {DIALOGS: [(DIALOG_W_OLD, DIALOG_W_NEW), (FIELD_OLD, FIELD_NEW)], WIDGETS: [(MODAL_OLD, MODAL_NEW)]}
+          HAND = """                        app.quick_tool = pdfcraft_ui_egui::QuickTool::Hand;
+                                  pdfcraft_ui_egui::set_touch_ui(true);
+          """ if RANK >= 4 else ""
+
+          TOUCH_ANCHOR_OLD = "/// Quick-action bar tools (the vertical floating strip)."
+          TOUCH_ANCHOR_NEW = """static TOUCH_UI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+          /// Called by the web app on phones: touch-sized controls, and dragging scrolls instead of selecting.
+          pub fn set_touch_ui(on: bool) {
+              TOUCH_UI.store(on, std::sync::atomic::Ordering::Relaxed);
+          }
+
+          pub(crate) fn touch_ui() -> bool {
+              TOUCH_UI.load(std::sync::atomic::Ordering::Relaxed)
+          }
+
+          /// The tool Read mode uses: the hand on a phone (a drag scrolls), the selection tool elsewhere.
+          pub(crate) fn read_tool() -> QuickTool {
+              if touch_ui() { QuickTool::Hand } else { QuickTool::Select }
+          }
+
+          """ + TOUCH_ANCHOR_OLD
+          READTOOL1_OLD = """        if mode == Mode::Read {
+                      self.quick_tool = QuickTool::Select;
+                  }"""
+          READTOOL1_NEW = """        if mode == Mode::Read {
+                      self.quick_tool = read_tool();
+                  }"""
+          READTOOL2_OLD = """            } else {
+                          self.quick_tool = QuickTool::Select;
+                      }
+                  } else if mode != Mode::Read && was_read {"""
+          READTOOL2_NEW = """            } else {
+                          self.quick_tool = read_tool();
+                      }
+                  } else if mode != Mode::Read && was_read {"""
+          LIB_TOUCH_PAIRS = [(TOUCH_ANCHOR_OLD, TOUCH_ANCHOR_NEW), (READTOOL1_OLD, READTOOL1_NEW), (READTOOL2_OLD, READTOOL2_NEW)]
 
           READING_FNS_OLD = "impl PdfCraftApp {\n    fn finish_render_frame(&mut self, ctx: &egui::Context) {"
           READING_FNS_NEW = """/// Full-screen reading (phones): the bars hide so the page fills the screen.
@@ -440,7 +589,7 @@ jobs:
                   (RESTORE, RESTORE + """                    // Phones (the Android app passes `?mobile=1`): a slightly larger interface for fingers.
                               if is_touch_phone() {
                                   app.system_text_scale = 1.15;
-          """ + TOUCH_FLAG + """                    }
+          """ + HAND + TOUCH_FLAG + """                    }
           """),
                   (QUERY, """/// `?mobile=1` (set by the Android app and by the page's own phone check), or a narrow window.
           #[cfg(target_arch = "wasm32")]
@@ -479,9 +628,29 @@ jobs:
                   if path in out:  # (none of the width files is edited above, but stay safe)
                       sys.exit("ui_patch: unexpected double edit of " + path)
                   out[path] = text
+          if RANK >= 2:
+              pass
           if RANK >= 3:
               out[LIB] = edit_text(out[LIB], LIB, [(READING_FNS_OLD, READING_FNS_NEW), (READING_CHROME_OLD, READING_CHROME_NEW), (READING_EXIT_OLD, READING_EXIT_NEW)])
               out[CHROME] = edit_text(out[CHROME], CHROME, [(READING_BAR_OLD, READING_BAR_NEW)])
+          if RANK >= 4:
+              # Dragging scrolls (the hand tool) on phones; the top bar scrolls; dialogs fit; pages touch in reading mode.
+              out[LIB] = edit_text(out[LIB], LIB, LIB_TOUCH_PAIRS + [(
+                  """    ctx.data_mut(|d| d.insert_temp(egui::Id::new("pdfcraft-reading"), on));
+          """, """    ctx.data_mut(|d| d.insert_temp(egui::Id::new("pdfcraft-reading"), on));
+              crate::canvas::set_tight_pages(on);
+          """)])
+              out[CHROME] = edit_text(out[CHROME], CHROME, TAB_PAIRS + [(
+                  """                            app.switch_mode(Mode::Read, true);
+          """, """                            app.switch_mode(Mode::Read, true);
+                                      app.quick_tool = crate::QuickTool::Hand;
+          """)])
+              out[CANVAS] = edit_text(out[CANVAS], CANVAS, GAP_PAIRS)
+              for path, pairs in EXTRA_PAIRS.items():
+                  if path in out:
+                      out[path] = edit_text(out[path], path, pairs)
+                  else:
+                      out[path] = edit(path, pairs)
           for path, text in out.items():
               with open(path, "w", encoding="utf-8") as f:
                   f.write(text)
@@ -783,13 +952,13 @@ jobs:
           fi
 
       # The phone UI edits the Rust sources. A fast `cargo check` picks the richest set of edits that
-      # compiles (read > all > bar > layout), so one broken piece never costs the others; if none
+      # compiles (more > read > all > bar > layout), so one broken piece never costs the others; if none
       # compiles, the stock UI is built. The Android glue (plain HTML/JS) is kept in every case.
       - name: Choose the phone UI (cargo check)
         id: ui
         run: |
           tier=stock
-          for t in read all bar layout; do
+          for t in more read all bar layout; do
             git checkout -- .
             if python3 mobile-ci/ui_patch.py "$t" && (cd apps/pdfcraft-web && cargo check --target wasm32-unknown-unknown); then
               tier=$t
